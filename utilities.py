@@ -1,5 +1,5 @@
 import numpy as np
-import scipy
+import scipy.linalg
 import inspect
 
 
@@ -33,6 +33,13 @@ def pack_jacobians(jacdict, inputs, outputs, T):
         for iI in range(nI):
             outjac[(T * iO):(T * (iO + 1)), (T * iI):(T * (iI + 1))] = subdict.get(inputs[iI], np.zeros((T, T)))
     return outjac
+
+
+def J_to_HU(J, H, unknowns, targets):
+    """Jacdict to LU-factored jacobian."""
+    H_U = pack_jacobians(J, unknowns, targets, H)
+    H_U_factored = factor(H_U)
+    return H_U_factored
 
 
 '''Part 2: Efficient Newton step'''
