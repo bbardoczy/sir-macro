@@ -8,12 +8,13 @@ Date: 3/27/2020
 # import standard python packages
 import numpy as np
 import matplotlib.pyplot as plt
+import scipy.optimize as opt
 
 # import supporting routines that are not specific to this model
 import utilities as utils
 
 
-'''Part 1: Routines'''
+'''Part 1: Transition dynamics of epidemic'''
 
 
 def initial_ss(A=39.8, beta=0.96**(1/52), theta=36):
@@ -55,10 +56,6 @@ def td_sir(pi3=0.6165, H=250, eps=0.001, pid=0.07/18, pir=0.99*7/18, phi=0.8, th
     # aggregates
     N = n * (S + I + R)
     C = S * cs + I * ci + R * cr
-
-    # terminal steady state: recovered or died
-    # target = R[-1] + D[-1]
-    # print(f'The share of people who recovered or died is {target:.4f}')
 
     return {'S': S, 'I': I, 'R': R, 'D': D, 'P': P, 'N': N, 'C': C}
 
@@ -169,7 +166,7 @@ def get_J(ss, ctax, pr_treat=np.zeros(250), pr_vacc=np.zeros(250), pi1=0.0046, p
         td_nr = td_eval(ns=ss['N'] * np.ones(H), ni=ss['N'] * np.ones(H), nr=ss['N'] + h * (np.arange(H) == t),
                         U_ss=ss['U'], ctax=ctax, pi1=pi1, pi2=pi2, pi3=pi3, H=H, eps=eps, pidbar=pidbar, pir=pir,
                         phi=phi, theta=theta, A=A, beta=beta, c_ss=ss['C'], n_ss=ss['N'], kappa=kappa,
-                        pr_treat=pr_treat, pr_vacc=pr_vacc,)
+                        pr_treat=pr_treat, pr_vacc=pr_vacc)
 
         # jacobian as nested dict
         for o in td_ns.keys():
@@ -182,25 +179,23 @@ def get_J(ss, ctax, pr_treat=np.zeros(250), pr_vacc=np.zeros(250), pi1=0.0046, p
 
 def td_solve(ctax, pr_treat=np.zeros(250), pr_vacc=np.zeros(250), pi1=0.0046, pi2=7.3983, pi3=0.2055, eps=0.001,
              pidbar=0.07 / 18, pir=0.99 * 7 / 18, kappa=0.0, phi=0.8, theta=36, A=39.8, beta=0.96**(1/52), maxit=50,
-             h=1E-4, tol=1E-8, noisy=False):
+             h=1E-4, tol=1E-8, noisy=False, H_U=None):
     """Solve SIR-macro model via Newton's method."""
     # infer length from guess
     H = ctax.shape[0]
+    unknowns = ['ns', 'ni', 'nr']
+    targets = ['R1', 'R2', 'R3']
 
     # compute initial ss
     ss = initial_ss(A=A, beta=beta, theta=theta)
 
     # compute jacobian
-    print('Precomputing Jacobian...')
-    J = get_J(ss=ss, ctax=ctax, pi1=pi1, pi2=pi2, pi3=pi3, H=H, eps=eps, pidbar=pidbar, pir=pir, phi=phi, theta=theta,
-              A=A, beta=beta, h=h, kappa=kappa, pr_treat=pr_treat, pr_vacc=pr_vacc)
-    print('Go!')
-
-    # pack jacobian
-    unknowns = ['ns', 'ni', 'nr']
-    targets = ['R1', 'R2', 'R3']
-    H_U = utils.pack_jacobians(J, unknowns, targets, H)
-    H_U_factored = utils.factor(H_U)
+    if H_U is None:
+        print('Precomputing Jacobian...')
+        J = get_J(ss=ss, ctax=ctax, pi1=pi1, pi2=pi2, pi3=pi3, H=H, eps=eps, pidbar=pidbar, pir=pir, phi=phi,
+                  theta=theta, A=A, beta=beta, h=h, kappa=kappa, pr_treat=pr_treat, pr_vacc=pr_vacc)
+        H_U = utils.J_to_HU(J, H, unknowns, targets)
+        print('Done!')
 
     # initialize guess for unknowns to steady state length T
     Us = {k: np.full(H, ss[k]) for k in unknowns}
@@ -220,16 +215,105 @@ def td_solve(ctax, pr_treat=np.zeros(250), pr_vacc=np.zeros(250), pi1=0.0046, pi
             for k in errors:
                 print(f'   max error for {k} is {errors[k]:.2E}')
         if all(v < tol for v in errors.values()):
-            print(f'Convergence after {it} iterations!')
+            if noisy:
+                print(f'Convergence after {it} iterations!')
             break
         else:
             Hvec = utils.pack_vectors(results, targets, H)
-            Uvec -= utils.factored_solve(H_U_factored, Hvec)
+            Uvec -= utils.factored_solve(H_U, Hvec)
             Us = utils.unpack_vectors(Uvec, unknowns, H)
     else:
         raise ValueError(f'No convergence after {maxit} iterations!')
 
     return results
+
+
+'''
+Part 2: Optimal policy
+
+Computing the Ramsey policy takes a few minutes. I have found that 1E-3 is sufficient precision.
+'''
+
+
+def planner(ctax, s0=1, i0=1, r0=1, pr_treat=np.zeros(250), pr_vacc=np.zeros(250), pi1=0.0046, pi2=7.3983, pi3=0.2055,
+            eps=0.001, pidbar=0.07 / 18, pir=0.99 * 7 / 18, kappa=0.0, phi=0.8, theta=36, A=39.8, beta=0.96**(1/52),
+            maxit=100, h=1E-4, tol=1E-8, noisy=False, H_U=None):
+    """Objective function."""
+
+    # solve transition path for given guess
+    out = td_solve(ctax, pr_treat=pr_treat, pr_vacc=pr_vacc, pi1=pi1, pi2=pi2, pi3=pi3, eps=eps, pidbar=pidbar, pir=pir,
+                   kappa=kappa, phi=phi, theta=theta, A=A, beta=beta, maxit=maxit, h=h, tol=tol, noisy=noisy, H_U=H_U)
+
+    # welfare
+    W = s0 * out['S'][0] * out['Us'][0] + i0 * out['I'][0] * out['Ui'][0] + r0 * out['R'][0] * out['Ur'][0]
+
+    return -W
+
+
+def planner_jac(ctax, s0=1, i0=1, r0=1, pr_treat=np.zeros(250), pr_vacc=np.zeros(250), pi1=0.0046, pi2=7.3983,
+                pi3=0.2055, eps=0.001, pidbar=0.07 / 18, pir=0.99 * 7 / 18, kappa=0.0, phi=0.8, theta=36, A=39.8,
+                beta=0.96**(1/52), maxit=50, h=1E-4, tol=1E-8, noisy=False, H_U=None):
+    """Differentiate planner function."""
+    # 1. precompute Jacobian for solving equilibrium
+    if H_U is None:
+        print('Precomputing Jacobian...')
+        ss = initial_ss(A=A, beta=beta, theta=theta)
+        H = ctax.shape[0]
+        J = get_J(ss=ss, ctax=ctax, pi1=pi1, pi2=pi2, pi3=pi3, H=H, eps=eps, pidbar=pidbar, pir=pir, phi=phi,
+                  theta=theta, A=A, beta=beta, h=h, kappa=kappa, pr_treat=pr_treat, pr_vacc=pr_vacc)
+        H_U = utils.J_to_HU(J, H=H, unknowns=['ns', 'ni', 'nr'], targets=['R1', 'R2', 'R3'])
+        print('Done!')
+
+    # 2. welfare at current policy
+    W0 = planner(ctax=ctax, s0=s0, i0=i0, r0=r0, pr_treat=pr_treat, pr_vacc=pr_vacc, pi1=pi1, pi2=pi2, pi3=pi3,
+                 eps=eps, pidbar=pidbar, pir=pir, kappa=kappa, phi=phi, theta=theta, A=A, beta=beta, maxit=maxit, h=h,
+                 tol=tol, noisy=noisy, H_U=H_U)
+
+    # 3. perturb policy period by period
+    H = ctax.shape[0]
+    dW = np.zeros(H)
+    for t in range(H):
+        W1 = planner(ctax=ctax + h * (np.arange(H) == t), s0=s0, i0=i0, r0=r0, pr_treat=pr_treat,
+                     pr_vacc=pr_vacc,
+                     pi1=pi1, pi2=pi2, pi3=pi3, eps=eps, pidbar=pidbar, pir=pir, kappa=kappa, phi=phi, theta=theta,
+                     A=A, beta=beta, maxit=maxit, h=h, tol=tol, noisy=noisy, H_U=H_U)
+        dW[t] = (W1 - W0) / h
+
+    return dW
+
+
+def ramsey(ctax0=np.zeros(250), s0=1, i0=1, r0=1, pr_treat=np.zeros(250), pr_vacc=np.zeros(250), pi1=0.0046,
+           pi2=7.3983, pi3=0.2055, eps=0.001, pidbar=0.07 / 18, pir=0.99 * 7 / 18, kappa=0.0, phi=0.8, theta=36, A=39.8,
+           beta=0.96**(1/52), maxit=100, h=1E-4, tol=1E-8, tol_ramsey=1E-3, noisy=False):
+    """Brute-force maximization"""
+    # 1. precompute Jacobian for solving equilibrium and computing Jacobian EVERY TIME
+    print('Precomputing Jacobian...')
+    ss = initial_ss(A=A, beta=beta, theta=theta)
+    H = ctax0.shape[0]
+    J = get_J(ss=ss, ctax=ctax0, pi1=pi1, pi2=pi2, pi3=pi3, H=H, eps=eps, pidbar=pidbar, pir=pir, phi=phi,
+              theta=theta, A=A, beta=beta, h=h, kappa=kappa, pr_treat=pr_treat, pr_vacc=pr_vacc)
+    H_U = utils.J_to_HU(J, H=H, unknowns=['ns', 'ni', 'nr'], targets=['R1', 'R2', 'R3'])
+    print('Done!')
+
+    # objective
+    obj = lambda ctax: planner(ctax, s0=s0, i0=i0, r0=r0, pr_treat=pr_treat, pr_vacc=pr_vacc, pi1=pi1, pi2=pi2, pi3=pi3,
+                               eps=eps, pidbar=pidbar, pir=pir, kappa=kappa, phi=phi, theta=theta, A=A, beta=beta,
+                               maxit=maxit, h=h, tol=tol, noisy=noisy, H_U=H_U)
+
+    # derivative
+    jac = lambda ctax: planner_jac(ctax, s0=s0, i0=i0, r0=r0, pr_treat=pr_treat, pr_vacc=pr_vacc, pi1=pi1,
+                                   pi2=pi2, pi3=pi3, eps=eps, pidbar=pidbar, pir=pir, kappa=kappa, phi=phi, theta=theta,
+                                   A=A, beta=beta, maxit=maxit, h=h, tol=tol, noisy=noisy, H_U=H_U)
+
+    # run
+    res = opt.minimize(obj, jac=jac, x0=ctax0, method='BFGS', tol=tol_ramsey, options={'disp': True})
+
+    if res.success:
+        print('Success!')
+    else:
+        print('Fail!')
+
+    return res
 
 
 '''Part 3: Replication'''
